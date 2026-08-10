@@ -216,3 +216,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Audio files
+tts/outputs/*.wav
+app/outputs/*.wav
+app/test_audio/*.wav
+app/test_audio/*.mp4
+
+# Exceptions to audio ignore rule:
+!tts/outputs/sample_05.wav
+!app/outputs/pipeline_reply_05.wav
+!app/test_audio/fleurs_ground_truth.json
+
+# Audio files
+tts/outputs/*.wav
+app/outputs/*.wav
+app/test_audio/*.wav
+app/test_audio/*.mp4
+
+# Exceptions to audio ignore rule:
+!tts/outputs/sample_05.wav
+!app/outputs/pipeline_reply_05.wav
+!app/test_audio/fleurs_ground_truth.json
