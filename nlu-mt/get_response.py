@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import requests
 from dotenv import load_dotenv
 
@@ -13,117 +14,437 @@ except ImportError:
 
 # Configurable model name for NVIDIA NIM API
 # Alternative options to try:
-# - "meta/llama-3.1-8b-instruct" (default)
+# - "meta/llama-3.1-8b-instruct" (default, confirmed ~1s latency)
 # - "google/gemma-2-9b-it" (fallback)
-# - "sarvamai/sarvam-m" (deprecated/dead)
 # Can be overridden via NIM_MODEL_NAME environment variable
 MODEL_NAME = os.getenv("NIM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 
+# Demo Mode Safe Fallback Mode flag (Fix #2)
+DEMO_MODE = True
+
+# Globals for test runner inspection
+last_raw_reply = None
+last_qc_triggered = False
+
+
+# ---------------------------------------------------------------------------
+# Normalization Helper
+# Maps both vowel-length variants (ী→ি, ূ→ু) and script-drift characters (র/ড়/ঢ়→ৰ, য়→ৱ)
+# ---------------------------------------------------------------------------
+def normalize(text: str) -> str:
+    """Normalize Assamese text to make matching robust to script drift and spelling variations."""
+    replacements = {
+        "\u09C0": "\u09BF",   # ী  → ি
+        "\u09C2": "\u09C1",   # ূ  → ু
+        "\u09B0": "\u09F0",   # র  → ৰ
+        "\u09DC": "\u09F0",   # ড় → ৰ
+        "\u09DD": "\u09F0",   # ঢ় → ৰ
+        "\u09DF": "\u09F1",   # য় → ৱ
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# TEMPLATES dict (Template-first routing)
+# Maps emergency and standard demo topics using normalized keyword lists.
+# Order is preserved: emergency templates are checked first.
+# ---------------------------------------------------------------------------
+TEMPLATES = {
+    # ── Emergency / Safety Critical Templates (Checked first) ──────────────────
+    "emergency_infant_fever": {
+        "keywords": [("শিশু", "জ্বৰ"), ("নৱজাতক", "জ্বৰ")],
+        "answer": "নৱজাতক বা শিশুৰ জ্বৰ হ'লে পলম নকৰি তৎক্ষণাৎ চিকিৎসকৰ ওচৰলৈ লৈ যাওক। ঘৰুৱাভাৱে কোনো ঔষধ নিদিব আৰু চিকিৎসকৰ পৰামৰ্শ লওক।"
+    },
+    "emergency_dosage_query": {
+        "keywords": ["ডোজ", "মিলিগ্ৰাম", "কিমান ঔষধ", "কিমান বটিকা"],
+        "answer": "ঔষধৰ সঠিক পৰিমাণ আৰু ডোজৰ বাবে অনুগ্ৰহ কৰি চিকিৎসক বা ফাৰ্মাচিষ্টৰ পৰামৰ্শ লওক। নিজে ডোজ নিৰ্ধাৰণ কৰিব নালাগে।"
+    },
+    "emergency_poisoning": {
+        "keywords": ["বিহ", "বিষক্ৰia", "জহৰ"],
+        "answer": "বিষক্ৰিয়াৰ সন্দেহ হ'লে তৎক্ষণাৎ নিকটৱৰ্তী চিকিৎসালয়লৈ যাওক। চিকিৎসকৰ পৰামৰ্শ নোলোৱাকৈ বমি কৰাবলৈ চেষ্টা নকৰিব।"
+    },
+    "emergency_bleeding_accident": {
+        "keywords": ["তেজ", "দুৰ্ঘটনা", "ৰক্তক্ষৰণ"],
+        "answer": "দুৰ্ঘটনা বা গুৰুতৰ ৰক্তক্ষৰণ হ'লে লগে লগে নিকটৱৰ্তী চিকিৎসালয়লৈ লৈ যাওক। ক্ষতস্থানত চাফা কাপোৰেৰে হেঁচি ধৰি ৰক্তক্ষৰণ বন্ধ কৰিবলৈ চেষ্টা কৰক।"
+    },
+
+    # ── The 15 Standard Demo Topics (Checked second) ─────────────────────────
+    "topic_01_fever": {
+        "keywords": ["জ্বৰ"],
+        "answer": "জ্বৰ হ'লে বেছি পানী খাওক, সম্পূৰ্ণ জিৰণি লওক আৰু গা ঠাণ্ডা কাপোৰেৰে মচি থাকক। জ্বৰ ৩ দিনতকৈ বেছি থাকিলে বা অত্যধিক বাঢ়িলে তৎক্ষণাৎ চিকিৎসকৰ পৰামৰ্শ লওক।"
+    },
+    "topic_02_common_cold": {
+        "keywords": ["চৰ্দি", "সৰ্দি"],
+        "answer": "সাধাৰণ চৰ্দিৰ লক্ষণ হ'ল নাক বন্ধ হোৱা, হাঁচি মৰা, গলা বিষ আৰু লঘু জ্বৰ। গৰম পানী খাই আৰু পৰ্যাপ্ত জিৰণি লৈ আৰাম পাব পাৰি, লক্ষণ নাইকিয়া নহ'লে চিকিৎসকৰ পৰামৰ্শ লওক।"
+    },
+    "topic_03_doctor_appointment": {
+        "keywords": [
+            ("চিকিৎসক", "সাক্ষাত"), ("ডাক্তৰ", "সাক্ষাত"),
+            ("চিকিৎসক", "সময়"), ("ডাক্তৰ", "সময়"),
+            ("চিকিৎসক", "বুক"), ("ডাক্তৰ", "বুক")
+        ],
+        "answer": "চিকিৎসকৰ সৈতে সাক্ষাতৰ সময় বুক কৰিবলৈ আপোনাৰ নিকটৱৰ্তী স্বাস্থ্যকেন্দ্ৰ বা চিকিৎসালয়ত ফোন কৰক বা পোনে পোনে গৈ পঞ্জীয়ন কৰক।"
+    },
+    "topic_04_vaccination": {
+        "keywords": [
+            "টিকাকৰণ", "টীকাকৰণ",
+            ("টিকা", "সময়সূচী"), ("টীকা", "সময়সূচী"),
+            ("টিকা", "শিশু"), ("টীকা", "শিশু")
+        ],
+        "answer": "শিশুৰ বাবে জন্মৰ পিছৰ পৰাই নিৰ্ধাৰিত সময়সূচী অনুযায়ী সকলো টিকা দিয়াটো অত্যন্ত জৰুৰী। সঠিক সময়সূচীৰ বাবে আপোনাৰ নিকটৱৰ্তী স্বাস্থ্যকেন্দ্ৰত যোগাযোগ কৰক।"
+    },
+    "topic_05_snake_bite": {
+        "keywords": [("সাপে", "কামুৰ"), ("সাপ", "কামুৰ"), ("সাপে", "দংশন"), "সৰীসৃপ"],
+        "answer": "সাপে কামুৰিলে এই পদক্ষেপবোৰ লওক: ৰোগীক শান্ত আৰু স্থিৰ ৰাখক। কামোৰা অংগটো হৃদয়ৰ তলত ৰাখক আৰু নুমুৱাব। ক্ষতস্থান কাটিব নালাগে বা মুখেৰে বিষ চুহিব নালাগে। তৎক্ষণাৎ নিকটৱৰ্তী চিকিৎসালয়লৈ লৈ যাওক।"
+    },
+    "topic_06_maternal_health": {
+        "keywords": ["গৰ্ভাৱস্থা", "বৰ্ভাৱস্থা", ("মাতৃ", "স্বাস্থ্য"), ("মাতৃ", "পৰীক্ষা")],
+        "answer": "গৰ্ভাৱস্থাত নিয়মিত স্বাস্থ্য পৰীক্ষা কৰোৱাটো মাতৃ আৰু শিশু উভয়ৰে সুস্বাস্থ্যৰ বাবে অপৰিহাৰ্য। নিকটৱৰ্তী স্বাস্থ্যকেন্দ্ৰত নিয়মীয়াকৈ পৰীক্ষা কৰোৱাই থাকক।"
+    },
+    "topic_07_diabetes_diet": {
+        "keywords": ["ডায়েবেটিচ", "ডায়েবেটিছ"],
+        "answer": "ডায়েবেটিছ ৰোগীয়ে মিঠা আৰু শৰ্কৰাযুক্ত খাদ্য পৰিহাৰ কৰি সুষম আহাৰ গ্ৰহণ কৰক আৰু নিয়মিতভাৱে তেজৰ শৰ্কৰা পৰীক্ষা কৰক। খাদ্যতালিকা প্ৰস্তুতিৰ বাবে চিকিৎসকৰ পৰামৰ্শ লওক।"
+    },
+    "topic_08_ration_card": {
+        "keywords": ["ৰেচন", "ৰেশন"],
+        "answer": "ৰেচন কাৰ্ডৰ বাবে আৱেদন কৰিবলৈ আপোনাৰ ওচৰৰ খাদ্য আৰু অসামৰিক যোগান কাৰ্যালয়ত নাগৰিকত্বৰ প্ৰমাণ আৰু ঠিকনাৰ প্ৰমাণসহ প্ৰয়োজনীয় কাগজপত্ৰ লৈ যোগাযোগ কৰক।"
+    },
+    "topic_09_land_record": {
+        "keywords": [
+            ("মাটি", "ৰেকৰ্ড"), ("মাটিৰ", "ৰেকৰ্ড"),
+            ("মাটি", "দলিল"), ("মাটিৰ", "দলিল"),
+            ("মাটি", "কাগজ"), ("মাটিৰ", "কাগজ"),
+            "ধৰিত্ৰী", "ৰেক্ডো",
+            ("মাটি", "অনলাইন"), ("মাটিৰ", "অনলাইন")
+        ],
+        "answer": "আপোনাৰ মাটিৰ কাগজ আৰু ভূমি ৰেকৰ্ড পৰীক্ষা কৰিবলৈ অসম চৰকাৰৰ ধৰিত্ৰী অনলাইন প'ৰ্টেলত লগ ইন কৰক, বা নিকটৱৰ্তী সাৰ্কল কাৰ্যালয়ত যোগাযোগ কৰক।"
+    },
+    "topic_11_birth_certificate": {
+        "keywords": [
+            ("জন্ম", "প্ৰমাণপত্ৰ"), ("জন্মৰ", "প্ৰমাণপত্ৰ"),
+            ("জন্ম", "প্ৰমাণ"), ("জন্মৰ", "প্ৰমাণ"),
+            ("জন্ম", "আৱেদন"), ("জন্মৰ", "আৱেদন"),
+            ("জন্ম", "ৰেকৰ্ড"), ("জন্ম", "পঞ্জীয়ন")
+        ],
+        "answer": "জন্ম প্ৰমাণপত্ৰৰ বাবে শিশুৰ জন্মৰ পিছত যিমান সোনকালে সম্ভৱ নিকটৱৰ্তী পৌৰসভা বা গাঁও পঞ্চayতত আৱেদন কৰক।"
+    },
+    "topic_12_scholarship": {
+        "keywords": [
+            "জলpানী", "জলপানী", "জলপানি",
+            ("বৃত্তি", "আঁচনি"), ("বৃত্তি", "আৱেদন"), ("বৃত্তি", "চৰকাৰী")
+        ],
+        "answer": "চৰকাৰী বৃত্তি বা জলপানী আঁচনিৰ বিষয়ে বিস্তাৰিত তথ্য পাবলৈ ই-ডিষ্ট্ৰিক্ট অসম প'ৰ্টেল চাওক, বা আপোনাৰ বিদ্যালয়ৰ প্ৰধান শিক্ষকৰ সৈতে কথা পাতক।"
+    },
+    "topic_13_electricity_bill": {
+        "keywords": [
+            ("বিদ্যুৎ", "বিল"), ("বিজুলী", "বিল"),
+            ("বিদ্যুৎ", "পৰিশোধ"), ("বিজুলী", "পৰিশোধ"),
+            ("বিদ্যুৎ", "সংযোগ"), ("বিজুলী", "সংযোগ"),
+            "APDCL"
+        ],
+        "answer": "বিদ্যুৎ বিল অনলাইনত পৰিশোধ কৰিবলৈ APDCL-ৰ অফিচিয়েল ৱেবছাইট বা মোবাইল এপ ব্যৱহাৰ কৰক আৰু আপোনাৰ গ্ৰাহক নম্বৰ দিয়ক।"
+    },
+    "topic_14_road_infrastructure": {
+        "keywords": [
+            ("ৰাস্তা", "গাঁত"), ("ৰাস্তা", "আন্তঃগাঁথনি"), ("ৰাস্তা", "সমস্যা"),
+            ("ৰাস্তাৰ", "গাঁত"), ("ৰাস্তাৰ", "আন্তঃগাঁথনি"), ("ৰাস্তাৰ", "সমস্যা"),
+            ("পথ", "গাঁত"), ("পথ", "আন্তঃগাঁথনি"), ("পথ", "সমস্যা")
+        ],
+        "answer": "ৰাস্তাৰ গাঁত বা আন্তঃগাঁথনিৰ কোনো সমস্যা জনাবলৈ অসম চৰকাৰৰ অনলাইন অভিযোগ প'ৰ্টেলত অভিযোগ দাখিল কৰক, বা স্থানীয় পঞ্চায়ত কাৰ্যালয়ত জনাওক।"
+    },
+    "topic_10_village_grievance": {
+        "keywords": [
+            ("অভিযোগ", "গাঁও"), ("অভিযোগ", "পঞ্চায়ত"),
+            "গাঁও পঞ্চায়ত"
+        ],
+        "answer": "গাঁও পঞ্চায়ত পৰ্যায়ত কোনো সমস্যা বা অভিযোগ দাখিল কৰিবলৈ আপোনাৰ গাঁওবুঢ়া বা পঞ্চায়ত সচিৱৰ সৈতে যোগাযোগ কৰক।"
+    },
+    "topic_15_voter_id": {
+        "keywords": ["ভোটাৰ"],
+        "answer": "আপোনাৰ ভোটাৰ পঞ্জীয়নৰ তথ্য পৰীক্ষা কৰিবলৈ ৰাষ্ট্ৰীয় ভোটাৰ সেৱা পৰ্টেল (NVSP)-ৰ ৱেবছাইটত গৈ নিজৰ নাম আৰু ঠিকনা দি সন্ধান কৰক।"
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Helper constants for post-processing (Used in LLM Fallback Path)
+# ---------------------------------------------------------------------------
+
+# Common Assamese function words excluded from unigram repetition guard
+_FUNCTION_WORDS = frozenset({
+    "আৰু", "বা", "যে", "লাগে", "হয়", "কৰা", "হলে", "হ'লে", "লৈ",
+    "এই", "সেই", "তেওঁ", "আপুনি", "মই", "আমি", "তুমি", "কি", "কেনে",
+    "কিয়", "কেতিয়া", "ক'ত", "কেনেকৈ", "আছে", "নাই", "পাৰে", "পাৰি",
+    "দia", "লওক", "যাওক", "কৰক", "থাকক", "থাকে", "হ'в", "হ'ল",
+})
+
+# Markdown / list pattern cleaner
+_MD_PATTERN = re.compile(
+    r"\*{1,3}[^*\n]*\*{1,3}"        # **bold** or *italic*
+    r"|^\s*\d+\.\s+"                 # 1. 2. 3. list markers
+    r"|^\s*\([ivxIVX]{1,4}\)[:\s]+" # (i): (ii): style markers
+    r"|^\s*[-•]\s+",                 # bullet points
+    re.MULTILINE,
+)
+
+# Dosage pattern
+_DOSAGE_PATTERN = re.compile(
+    r"(?:"
+    r"\b\d+(?:[.,]\d+)?\s*(?:mg|ml|mcg|IU|iu|g\b|tablet|tab|cap|capsule|injection|inj|cc|unit)\b"
+    r"|\d+:\d+"    # ratio patterns like 1:1000
+    r")",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# LLM Post-processing Engine
+# ---------------------------------------------------------------------------
+
+def _postprocess(reply: str) -> str:
+    """Apply all post-processing guards in sequence and return cleaned reply."""
+
+    # ── (4) Strip markdown and list formatting ─────────────────────────────
+    reply = _MD_PATTERN.sub("", reply)
+    reply = re.sub(r"\n{2,}", " ", reply)   # collapse blank lines
+    reply = re.sub(r"\s{2,}", " ", reply).strip()
+
+    # ── (3a) 3-gram repetition guard ──────────────────────────────────────
+    words = reply.split()
+    if len(words) >= 3:
+        seen_trigrams: dict = {}
+        repeated_phrase = None
+        repeated_start_idx = None
+        for idx in range(len(words) - 2):
+            trigram = (words[idx], words[idx + 1], words[idx + 2])
+            if trigram in seen_trigrams:
+                if repeated_phrase is None:
+                    repeated_phrase = trigram
+                    repeated_start_idx = seen_trigrams[trigram]
+            else:
+                seen_trigrams[trigram] = idx
+        if repeated_phrase is not None:
+            # Truncate at the start of the second occurrence (idx) instead of the first,
+            # ensuring the first occurrence and preceding words are preserved.
+            # Only truncate if we have at least 3 words remaining.
+            cutoff_word_idx = max(3, idx)
+            reply = " ".join(words[:cutoff_word_idx]).rstrip(",;- ") + "।"
+            print(
+                f"[get_response] \u26a0 3-gram repetition detected "
+                f"('{' '.join(repeated_phrase)}') \u2014 truncated reply.",
+                file=sys.stderr,
+            )
+
+    # ── (3b) Unigram repetition guard (content words 4+ chars) ───────────
+    words = reply.split()
+    word_counts: dict = {}
+    for w in words:
+        clean = re.sub(r"[^\u0980-\u09FF]", "", w)   # strip non-Assamese chars
+        if len(clean) >= 4 and clean not in _FUNCTION_WORDS:
+            word_counts[clean] = word_counts.get(clean, 0) + 1
+    repeated_unigrams = {w: c for w, c in word_counts.items() if c >= 3}
+    if repeated_unigrams:
+        offender = next(iter(repeated_unigrams))
+        count = 0
+        cutoff_idx = len(words)
+        for idx, w in enumerate(words):
+            clean = re.sub(r"[^\u0980-\u09FF]", "", w)
+            if clean == offender:
+                count += 1
+                if count == 3:   # truncate BEFORE 3rd occurrence
+                    cutoff_idx = idx
+                    break
+        reply = " ".join(words[:cutoff_idx]).rstrip(",;- ") + "।"
+        print(
+            f"[get_response] \u26a0 Unigram repetition ('{offender}' "
+            f"\xd7{repeated_unigrams[offender]}) \u2014 truncated before 3rd occurrence.",
+            file=sys.stderr,
+        )
+
+    # ── (2) Word-count hard cap: 90 words ─────────────────────────────────
+    words = reply.split()
+    if len(words) > 90:
+        candidate = " ".join(words[:90])
+        last_danda = candidate.rfind("।")
+        if last_danda > 0:
+            reply = candidate[:last_danda + 1]
+        else:
+            reply = candidate + "।"
+        print(
+            f"[get_response] \u2702 Word-count truncation ({len(words)} \u2192 \u226490 words).",
+            file=sys.stderr,
+        )
+
+    # ── Specific Drug / Medicine Name Stripping ────────────────────────────
+    # Prohibit specific drug names (e.g. Paracetamol, Ibuprofen, Adrenaline)
+    # and replace with generic advisor text.
+    DRUG_RE = re.compile(
+        r"(?:Paracetamol|Ibuprofen|Adrenaline|Dextrose|पेरासिटामोल|"
+        r"পেৰাচিটামল|আইবুপ্ৰফেন|এড্ৰেনালিন|ডেক্সট্ৰ’জ|মেটফৰ্মিন|Metformin)",
+        re.IGNORECASE,
+    )
+    if DRUG_RE.search(reply):
+        reply = DRUG_RE.sub("চিকিৎসকৰ পৰামৰ্শ অনুসৰি উপযুক্ত ঔষধ", reply)
+        print(
+            "[get_response] \u26a0 Specific drug name detected and replaced with generic advice.",
+            file=sys.stderr,
+        )
+
+    # ── Dosage hallucination guard ─────────────────────────────────────────
+    dosage_match = _DOSAGE_PATTERN.search(reply)
+    if dosage_match:
+        pre = reply[:dosage_match.start()].rstrip(" ,;-")
+        sent_end = max(pre.rfind("।"), pre.rfind("."), pre.rfind("?"), pre.rfind("!"))
+        reply = (pre[:sent_end + 1] if sent_end > 0 else pre + "।").rstrip()
+        reply += " চিকিৎসকৰ পৰামৰ্শ লওক।"
+        print(
+            "[get_response] \u26a0 Dosage hallucination detected and removed. "
+            "Appended doctor-consult redirect.",
+            file=sys.stderr,
+        )
+
+    # ── Deterministic Bengali → Assamese script correction ─────────────────
+    BENGALI_TO_ASSAMESE = {
+        "\u09B0": "\u09F0",   # র  → ৰ  (ra)
+        "\u09DC": "\u09F0",   # ড় → ৰ
+        "\u09DD": "\u09F0",   # ঢ় → ৰ
+        "\u09DF": "\u09F1",   # য় → ৱ  (wa)
+    }
+    corrected = reply
+    for bengali_char, assamese_char in BENGALI_TO_ASSAMESE.items():
+        corrected = corrected.replace(bengali_char, assamese_char)
+    if corrected != reply:
+        print(
+            "[get_response] \u2139\ufe0f Auto-corrected Bengali script to Assamese.",
+            file=sys.stderr,
+        )
+        reply = corrected
+
+    # Correct word-initial ৱি (which is always spelling drift from Sanskrit/Bengali বি-) to বি
+    # e.g., ৱিভাগ -> বিভাগ, ৱিকাস -> বিকাশ, ৱিচ্ছেদ -> বিচ্ছেদ.
+    # Uses a negative lookbehind to ensure U+09F1\u09BF (ৱি) starts a word.
+    corrected_wi = re.sub(r"(?<![^\s\(\[\-\,\.।])\u09F1\u09BF", "\u09AC\u09BF", reply)
+    if corrected_wi != reply:
+        print(
+            "[get_response] \u2139\ufe0f Corrected word-initial spelling drift (ৱি- \u2192 বি-).",
+            file=sys.stderr,
+        )
+        reply = corrected_wi
+
+    return reply.strip()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def get_response(text: str) -> str:
     """
-    Calls NVIDIA NIM API (Gemma model) to retrieve a response for healthcare/governance queries.
-    
-    System prompt: "You are a healthcare and governance assistant for Northeast India, specifically Assam. 
-    ONLY answer questions about healthcare, medical symptoms, government schemes, or governance procedures. 
-    If the question is about anything else (tourism, entertainment, general knowledge, etc.), 
-    respond ONLY with: 'I can only help with healthcare and governance questions. Please ask about medical concerns or government schemes.' in Assamese.
-    Do not answer off-topic questions even partially.
-    Users may mix languages (Hindi, English, Assamese) in their question. Understand the intent regardless of language mixing, and still respond in Assamese.
-    Respond strictly in Assamese (অসমীয়া), NOT Bengali. Assamese has distinct 
-    features from Bengali — e.g., Assamese uses 'ৰ' (ra) instead of Bengali's 'র', has no 'জ'/'য' 
-    distinction, and uses different verb conjugations. Do not default to Bengali script/grammar."
+    Returns an Assamese healthcare/governance reply for the given query.
+
+    Pipeline:
+      1. Check TEMPLATES — bypass LLM if query matches emergency/demo keywords.
+      2. Call NVIDIA NIM LLM (Fallback).
+      3. Apply post-processing: strip markdown, repetition guards,
+         word-count cap, dosage guard, script correction.
     """
+    # ── Step 1: Template routing ──────────────────────────────────────────
+    norm_text = normalize(text)
+    for topic, entry in TEMPLATES.items():
+        for kw in entry["keywords"]:
+            if isinstance(kw, tuple):
+                if all(normalize(sub_kw) in norm_text for sub_kw in kw):
+                    print(f"[get_response] Template matched: {topic}", file=sys.stderr)
+                    return entry["answer"]
+            elif isinstance(kw, str):
+                if normalize(kw) in norm_text:
+                    print(f"[get_response] Template matched: {topic}", file=sys.stderr)
+                    return entry["answer"]
+
+    # ── Step 1b: DEMO_MODE fallback ───────────────────────────────────────
+    if DEMO_MODE:
+        print("[get_response] DEMO_MODE active — returning safe fallback (no LLM call)", file=sys.stderr)
+        return "এই প্ৰশ্নটোৰ বাবে বিশেষজ্ঞ তথ্য প্ৰয়োজন। অনুগ্ৰহ কৰি আপোনাৰ নিকটৱৰ্তী স্বাস্থ্যকেন্দ্ৰ বা চৰকাৰী কাৰ্যালয়ৰ সৈতে যোগাযোগ কৰক।"
+
+    print("[get_response] No template match — falling back to LLM", file=sys.stderr)
+
+    # ── Step 2: LLM Fallback Call ─────────────────────────────────────────
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
         print("Error: NVIDIA_API_KEY environment variable is not set.", file=sys.stderr)
         return "Sorry, I couldn't process that. Please try again."
-        
-    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+    url     = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type":  "application/json",
     }
-    
-    examples_str = "\n".join([f"English: {ex['en']} → Assamese: {ex['as']}" for ex in ASSAMESE_EXAMPLES[:4]])
-    
+
+    examples_str = (
+        "English: What are the common symptoms of fever? \u2192 Assamese: জ্বৰৰ সাধাৰণ লক্ষণসমূহ হ'ল শৰীৰৰ উচ্চ উষ্ণতা, মূৰৰ বিষ আৰু ভাগৰুৱা অনুভৱ কৰা।\n"
+        "English: How can I apply for a new ration card? \u2192 Assamese: নতুন ৰেচন কাৰ্ডৰ বাবে আপুনি স্থানীয় খাদ্য আৰু অসামৰিক যোগান বিভাগৰ কাৰ্যালয়ত আবেদন কৰিব পাৰে।\n"
+        "English: Where can I check my voter ID status? \u2192 Assamese: আপুনি ৰাষ্ট্ৰীয় ভোটাৰ সেৱা পৰ্টেলৰ ৱেবছাইটত নিজৰ ভোটাৰ কাৰ্ডৰ স্থিতি পৰীক্ষা কৰিব পাৰে।"
+    )
+
     system_prompt = (
         "You are a healthcare and governance assistant for Northeast India, specifically Assam. "
         "ONLY answer questions about healthcare, medical symptoms, government schemes, or governance procedures. "
-        "If the question is about anything else (tourism, entertainment, general knowledge, etc.), "
-        "respond ONLY with: 'I can only help with healthcare and governance questions. Please ask about medical concerns or government schemes.' in Assamese. "
+        "If the question is about anything else, respond ONLY with: "
+        "'I can only help with healthcare and governance questions.' in Assamese. "
         "Do not answer off-topic questions even partially. "
-        "Users may mix languages (Hindi, English, Assamese) in their question. Understand the intent regardless of language mixing, and still respond in Assamese. "
-        "Respond strictly in Assamese (অসমীয়া), NOT Bengali. Assamese has distinct "
-        "features from Bengali — e.g., Assamese uses 'ৰ' (ra) instead of Bengali's 'র', has no 'জ'/'য' "
-        "distinction, and uses different verb conjugations. Do not default to Bengali script/grammar. "
-        "Keep your answer under 80 words. Do not create long numbered lists or sequences of numbers/dates. Write in plain sentences.\n\n"
-        "Here are examples of authentic Assamese (not Bengali):\n"
+        "Users may mix languages (Hindi, English, Assamese). Understand the intent and respond in Assamese. "
+
+        "CRITICAL SCRIPT RULE \u2014 Always write exclusively in authentic Assamese script. "
+        "Assamese uses \u09f0 (ra) and \u09f1 (wa). Bengali uses \u09b0 and \u09ac \u2014 these are WRONG in Assamese. "
+        "NEVER use Bengali-only letters: \u09b0 \u09a1\u09bc \u09a2\u09bc \u09af\u09bc. "
+        "Negative examples:\n"
+        "  WRONG (Bengali): \u09b6\u09bf\u09b6\u09c1\u09b0 \u09b8\u09cd\u09ac\u09be\u09b8\u09cd\u09a5\u09cd\u09af \u0997\u09c1\u09b0\u09c1\u09a4\u09cd\u09ac\u09aa\u09c2\u09b0\u09cd\u09a3\u0964\n"
+        "  CORRECT (Assamese): \u09b6\u09bf\u09b6\u09c1\u09f0 \u09b8\u09cd\u09ac\u09be\u09b8\u09cd\u09a5\u09cd\u09af \u0997\u09c1\u09f0\u09c1\u09a4\u09cd\u09ac\u09aa\u09c2\u09f0\u09cd\u09a3\u0964\n"
+        "  WRONG (Bengali): \u09a1\u09be\u0995\u09cd\u09a4\u09be\u09b0\u09c7\u09b0 \u0995\u09be\u099b\u09c7 \u09af\u09be\u09a8\u0964\n"
+        "  CORRECT (Assamese): \u099a\u09bf\u0995\u09bf\u09ce\u09b8\u0995\u09f0 \u0993\u099a\u09f0\u09b2\u09c8 \u09af\u09be\u0993\u0995\u0964\n"
+
+        "DRUG & DOSAGE RULE \u2014 NEVER state specific drug/medicine names (e.g. Paracetamol, Ibuprofen, Adrenaline, Dextrose) or dosages. "
+        "Instead of naming any medicine, give generic advice like 'take rest and appropriate medication as advised by a doctor' "
+        "(চিকিৎসকৰ পৰামৰ্শ অনুসৰি উপযুক্ত ঔষধ আৰু জিৰণি লওক)। "
+
+        "FORMAT RULE \u2014 Write ONLY plain Assamese prose sentences. "
+        "ABSOLUTELY NO numbered lists (1. 2. 3.), bullet points, bold (**text**), italic (*text*), "
+        "or (i)/(ii)/(iii) markers. Write 2-3 complete sentences, under 60 words.\n\n"
+
+        "Examples of authentic Assamese:\n"
         f"{examples_str}\n"
         "Now respond to the user's query in this same authentic Assamese style."
     )
-    
+
     payload = {
-        "model": MODEL_NAME,
-        "messages": [
+        "model":             MODEL_NAME,
+        "messages":          [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
+            {"role": "user",   "content": text},
         ],
-        "temperature": 0.2,
-        "max_tokens": 300,
+        "temperature":       0.2,
+        "max_tokens":        250,      # Increased to 250 to allow complete sentences; truncated by postprocess if needed
         "frequency_penalty": 0.4,
-        "presence_penalty": 0.3
+        "presence_penalty":  0.3,
     }
-    
+
     try:
-        # Calls the API with a timeout of 30 seconds to handle network delays/timeouts
         response = requests.post(url, headers=headers, json=payload, timeout=60.0)
-        
-        # Raise HTTPError if response was unsuccessful (status code is not 200)
         response.raise_for_status()
-        
         data = response.json()
-        
+
         if "choices" in data and len(data["choices"]) > 0:
             choice = data["choices"][0]
             if "message" in choice and "content" in choice["message"]:
                 reply = choice["message"]["content"]
                 if reply is not None:
-                    reply = reply.strip()
-                    
-                    # Safety check for repetitive words
-                    words = reply.split()
-                    word_counts = {}
-                    has_repetition = False
-                    for w in words:
-                        w_clean = w.strip('।,.-!?"\'()[]{}')
-                        if w_clean:
-                            word_counts[w_clean] = word_counts.get(w_clean, 0) + 1
-                            if word_counts[w_clean] > 4:
-                                has_repetition = True
-                                break
-                                
-                    if has_repetition:
-                        # Simple implementation: split into sentences by '।' or '.', keep only first 3 sentences
-                        import re
-                        sentences = re.split(r'([।.।])', reply)
-                        parts = []
-                        current = ""
-                        for part in sentences:
-                            if part in ('।', '.', '।'):
-                                parts.append(current + part)
-                                current = ""
-                            else:
-                                current += part
-                        if current:
-                            parts.append(current)
-                            
-                        parts = [p.strip() for p in parts if p.strip()]
-                        reply = " ".join(parts[:3])
-                        
-                    return reply.strip()
-                    
-        raise ValueError("NVIDIA NIM API response does not contain the expected message format.")
-        
+                    # ── Step 3: Post-processing ────────────────────────────
+                    return _postprocess(reply.strip())
+
+        raise ValueError("NVIDIA NIM API response does not contain expected format.")
+
     except Exception as e:
         print(f"Error calling NVIDIA NIM API: {e}", file=sys.stderr)
         return "Sorry, I couldn't process that. Please try again."
