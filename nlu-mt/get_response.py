@@ -20,7 +20,7 @@ except ImportError:
 MODEL_NAME = os.getenv("NIM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 
 # Demo Mode Safe Fallback Mode flag (Fix #2)
-DEMO_MODE = True
+DEMO_MODE = False
 
 # Globals for test runner inspection
 last_raw_reply = None
@@ -337,6 +337,52 @@ def _postprocess(reply: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Translation Engine
+# ---------------------------------------------------------------------------
+
+def translate_en_to_as(text: str) -> str:
+    """
+    Translates English text to Assamese using the free Google Translate API.
+    Includes retry logic and safety fallbacks.
+    """
+    import urllib3
+    urllib3.disable_warnings()
+
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "en",
+        "tl": "as",
+        "dt": "t",
+        "q": text,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    print(f"[translate] Translating English response to Assamese...", file=sys.stderr)
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, headers=headers, params=params, verify=False, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            translated_chunks = []
+            if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                for chunk in data[0]:
+                    if isinstance(chunk, list) and len(chunk) > 0 and isinstance(chunk[0], str):
+                        translated_chunks.append(chunk[0])
+            if translated_chunks:
+                translated_text = "".join(translated_chunks)
+                return translated_text.strip()
+            raise ValueError("Translation format is unexpected.")
+        except Exception as e:
+            print(f"[translate] Attempt {attempt}/3 failed: {e}", file=sys.stderr)
+            if attempt == 3:
+                return "অনুগ্ৰহ কৰি আপোনাৰ নিকটৱৰ্তী স্বাস্থ্যকেন্দ্ৰ বা চৰকাৰী কাৰ্যালয়ৰ সৈতে যোগাযোগ কৰক।"
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -346,22 +392,23 @@ def get_response(text: str) -> str:
 
     Pipeline:
       1. Check TEMPLATES — bypass LLM if query matches emergency/demo keywords.
-      2. Call NVIDIA NIM LLM (Fallback).
-      3. Apply post-processing: strip markdown, repetition guards,
-         word-count cap, dosage guard, script correction.
+      2. Call NVIDIA NIM LLM to generate an English response (Fallback).
+      3. Translate English response to Assamese.
+      4. Apply post-processing script corrections & guards.
     """
-    # ── Step 1: Template routing ──────────────────────────────────────────
-    norm_text = normalize(text)
-    for topic, entry in TEMPLATES.items():
-        for kw in entry["keywords"]:
-            if isinstance(kw, tuple):
-                if all(normalize(sub_kw) in norm_text for sub_kw in kw):
-                    print(f"[get_response] Template matched: {topic}", file=sys.stderr)
-                    return entry["answer"]
-            elif isinstance(kw, str):
-                if normalize(kw) in norm_text:
-                    print(f"[get_response] Template matched: {topic}", file=sys.stderr)
-                    return entry["answer"]
+    # ── Step 1: Template routing (TEMPORARILY BYPASSED FOR TESTING) ───────
+    # norm_text = normalize(text)
+    # for topic, entry in TEMPLATES.items():
+    #     for kw in entry["keywords"]:
+    #         if isinstance(kw, tuple):
+    #             if all(normalize(sub_kw) in norm_text for sub_kw in kw):
+    #                 print(f"[get_response] Template matched: {topic}", file=sys.stderr)
+    #                 return entry["answer"]
+    #         elif isinstance(kw, str):
+    #             if normalize(kw) in norm_text:
+    #                 print(f"[get_response] Template matched: {topic}", file=sys.stderr)
+    #                 return entry["answer"]
+    pass
 
     # ── Step 1b: DEMO_MODE fallback ───────────────────────────────────────
     if DEMO_MODE:
@@ -370,7 +417,7 @@ def get_response(text: str) -> str:
 
     print("[get_response] No template match — falling back to LLM", file=sys.stderr)
 
-    # ── Step 2: LLM Fallback Call ─────────────────────────────────────────
+    # ── Step 2: LLM Fallback Call (English output) ────────────────────────
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
         print("Error: NVIDIA_API_KEY environment variable is not set.", file=sys.stderr)
@@ -383,39 +430,32 @@ def get_response(text: str) -> str:
     }
 
     examples_str = (
-        "English: What are the common symptoms of fever? \u2192 Assamese: জ্বৰৰ সাধাৰণ লক্ষণসমূহ হ'ল শৰীৰৰ উচ্চ উষ্ণতা, মূৰৰ বিষ আৰু ভাগৰুৱা অনুভৱ কৰা।\n"
-        "English: How can I apply for a new ration card? \u2192 Assamese: নতুন ৰেচন কাৰ্ডৰ বাবে আপুনি স্থানীয় খাদ্য আৰু অসামৰিক যোগান বিভাগৰ কাৰ্যালয়ত আবেদন কৰিব পাৰে।\n"
-        "English: Where can I check my voter ID status? \u2192 Assamese: আপুনি ৰাষ্ট্ৰীয় ভোটাৰ সেৱা পৰ্টেলৰ ৱেবছাইটত নিজৰ ভোটাৰ কাৰ্ডৰ স্থিতি পৰীক্ষা কৰিব পাৰে।"
+        "Query: জ্বৰ হ'লে কি কৰিব লাগে? -> Response: If you have fever, you should take plenty of rest, drink enough water, and keep yourself cool. If the fever persists for more than three days, you should consult a doctor.\n"
+        "Query: How can I apply for a new ration card? -> Response: To apply for a new ration card, you should visit your nearest food and civil supplies office with your citizenship and address proof documents.\n"
+        "Query: Where can I check my voter ID status? -> Response: You can check your voter registration status by visiting the official National Voters' Service Portal website."
     )
 
     system_prompt = (
         "You are a healthcare and governance assistant for Northeast India, specifically Assam. "
-        "ONLY answer questions about healthcare, medical symptoms, government schemes, or governance procedures. "
+        "Your users will ask questions in Assamese, Hindi, English, or mixed languages. "
+        "You must understand their query, but you must respond ONLY in clean, plain English prose. "
+        "DO NOT use Assamese script or Hindi script in your response. "
+        
+        "SCOPE RULE: Only answer questions about healthcare, medical symptoms, government schemes, or governance procedures. "
         "If the question is about anything else, respond ONLY with: "
-        "'I can only help with healthcare and governance questions.' in Assamese. "
+        "'I can only help with healthcare and governance questions.' "
         "Do not answer off-topic questions even partially. "
-        "Users may mix languages (Hindi, English, Assamese). Understand the intent and respond in Assamese. "
 
-        "CRITICAL SCRIPT RULE \u2014 Always write exclusively in authentic Assamese script. "
-        "Assamese uses \u09f0 (ra) and \u09f1 (wa). Bengali uses \u09b0 and \u09ac \u2014 these are WRONG in Assamese. "
-        "NEVER use Bengali-only letters: \u09b0 \u09a1\u09bc \u09a2\u09bc \u09af\u09bc. "
-        "Negative examples:\n"
-        "  WRONG (Bengali): \u09b6\u09bf\u09b6\u09c1\u09b0 \u09b8\u09cd\u09ac\u09be\u09b8\u09cd\u09a5\u09cd\u09af \u0997\u09c1\u09b0\u09c1\u09a4\u09cd\u09ac\u09aa\u09c2\u09b0\u09cd\u09a3\u0964\n"
-        "  CORRECT (Assamese): \u09b6\u09bf\u09b6\u09c1\u09f0 \u09b8\u09cd\u09ac\u09be\u09b8\u09cd\u09a5\u09cd\u09af \u0997\u09c1\u09f0\u09c1\u09a4\u09cd\u09ac\u09aa\u09c2\u09f0\u09cd\u09a3\u0964\n"
-        "  WRONG (Bengali): \u09a1\u09be\u0995\u09cd\u09a4\u09be\u09b0\u09c7\u09b0 \u0995\u09be\u099b\u09c7 \u09af\u09be\u09a8\u0964\n"
-        "  CORRECT (Assamese): \u099a\u09bf\u0995\u09bf\u09ce\u09b8\u0995\u09f0 \u0993\u099a\u09f0\u09b2\u09c8 \u09af\u09be\u0993\u0995\u0964\n"
+        "DRUG & DOSAGE RULE: NEVER state specific drug/medicine names (like Paracetamol, Ibuprofen, Adrenaline, Dextrose) or dosages. "
+        "Instead of naming any medicine, give generic advice like 'take rest and appropriate medication as advised by a doctor'. "
 
-        "DRUG & DOSAGE RULE \u2014 NEVER state specific drug/medicine names (e.g. Paracetamol, Ibuprofen, Adrenaline, Dextrose) or dosages. "
-        "Instead of naming any medicine, give generic advice like 'take rest and appropriate medication as advised by a doctor' "
-        "(চিকিৎসকৰ পৰামৰ্শ অনুসৰি উপযুক্ত ঔষধ আৰু জিৰণি লওক)। "
-
-        "FORMAT RULE \u2014 Write ONLY plain Assamese prose sentences. "
+        "FORMAT RULE: Write ONLY plain English prose sentences. "
         "ABSOLUTELY NO numbered lists (1. 2. 3.), bullet points, bold (**text**), italic (*text*), "
         "or (i)/(ii)/(iii) markers. Write 2-3 complete sentences, under 60 words.\n\n"
 
-        "Examples of authentic Assamese:\n"
+        "Examples of desired output:\n"
         f"{examples_str}\n"
-        "Now respond to the user's query in this same authentic Assamese style."
+        "Now respond to the user's query in plain English following all rules."
     )
 
     payload = {
@@ -425,7 +465,7 @@ def get_response(text: str) -> str:
             {"role": "user",   "content": text},
         ],
         "temperature":       0.2,
-        "max_tokens":        250,      # Increased to 250 to allow complete sentences; truncated by postprocess if needed
+        "max_tokens":        250,      # Increased to 250 to allow complete sentences
         "frequency_penalty": 0.4,
         "presence_penalty":  0.3,
     }
@@ -440,8 +480,13 @@ def get_response(text: str) -> str:
             if "message" in choice and "content" in choice["message"]:
                 reply = choice["message"]["content"]
                 if reply is not None:
-                    # ── Step 3: Post-processing ────────────────────────────
-                    return _postprocess(reply.strip())
+                    # Save raw English response for debugging/tests
+                    global last_raw_reply
+                    last_raw_reply = reply.strip()
+                    # ── Step 3: Translate to Assamese ──────────────────────
+                    translated_reply = translate_en_to_as(last_raw_reply)
+                    # ── Step 4: Post-processing on translated text ─────────
+                    return _postprocess(translated_reply)
 
         raise ValueError("NVIDIA NIM API response does not contain expected format.")
 

@@ -238,3 +238,13 @@ app/test_audio/*.mp4
 !tts/outputs/sample_05.wav
 !app/outputs/pipeline_reply_05.wav
 !app/test_audio/fleurs_ground_truth.json
+
+# Additional ignore patterns
+__pycache__/
+*.pyc
+.venv/
+.env
+app/outputs/*.wav
+tts/outputs/*.wav
+asr/outputs/*.wav
+*.wav
