@@ -6,7 +6,34 @@ import sys
 # Force reload main to prevent Streamlit from caching old mock functions/strings
 import main
 importlib.reload(main)
-from main import speech_to_text, get_response, text_to_speech
+
+# Also force reload sub-modules
+import get_response
+importlib.reload(get_response)
+
+from main import run_pipeline
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+
+SAMPLES = [
+    {"label": "Healthcare: Fever and basic care advice (sample_01.wav)", "filename": "sample_01.wav"},
+    {"label": "Healthcare: Symptoms of common cold (sample_02.wav)", "filename": "sample_02.wav"},
+    {"label": "Healthcare: How to book a doctor's appointment (sample_03.wav)", "filename": "sample_03.wav"},
+    {"label": "Healthcare: Vaccination schedule for children (sample_04.wav)", "filename": "sample_04.wav"},
+    {"label": "Healthcare: What to do in case of snake bite (sample_05.wav)", "filename": "sample_05.wav"},
+    {"label": "Healthcare: Maternal health checkup reminder (sample_06.wav)", "filename": "sample_06.wav"},
+    {"label": "Healthcare: Diabetes diet advice (sample_07.wav)", "filename": "sample_07.wav"},
+    {"label": "Governance: How to apply for a ration card (sample_08.wav)", "filename": "sample_08.wav"},
+    {"label": "Governance: Checking land record status (sample_09.wav)", "filename": "sample_09.wav"},
+    {"label": "Governance: Filing a village-level grievance (sample_10.wav)", "filename": "sample_10.wav"},
+    {"label": "Governance: Applying for a birth certificate (sample_11.wav)", "filename": "sample_11.wav"},
+    {"label": "Governance: Information on government scholarship scheme (sample_12.wav)", "filename": "sample_12.wav"},
+    {"label": "Governance: How to pay electricity bill online (sample_13.wav)", "filename": "sample_13.wav"},
+    {"label": "Governance: Reporting a road or infrastructure issue (sample_14.wav)", "filename": "sample_14.wav"},
+    {"label": "Governance: Checking voter ID registration status (sample_15.wav)", "filename": "sample_15.wav"},
+]
+
 
 st.set_page_config(
     page_title="Northeast Voice Assistant",
@@ -143,6 +170,87 @@ h1, h2, h3, h4, h5, h6 {
     font-family: 'Inter', sans-serif !important;
 }
 
+/* Custom Selectbox styling for light/dark mode compatibility */
+div[data-testid="stSelectbox"] > div {
+    background-color: #FFFFFF !important;
+    color: #1A1A1A !important;
+    border-radius: 8px !important;
+}
+
+div[data-testid="stSelectbox"] div[data-baseweb="select"] {
+    background-color: #FFFFFF !important;
+    border: 1px solid rgba(139, 115, 85, 0.3) !important;
+    border-radius: 8px !important;
+}
+
+/* Force selected text to be black and visible (high specificity overrides) */
+div[data-testid="stSelectbox"] span,
+div[data-testid="stSelectbox"] div,
+div[data-testid="stSelectbox"] input,
+div[data-testid="stSelectbox"] p,
+div[data-testid="stSelectbox"] li,
+div[data-testid="stSelectbox"] label {
+    color: #1A1A1A !important;
+    background-color: transparent !important;
+}
+
+/* Options dropdown container and items */
+div[data-baseweb="popover"] ul, [data-baseweb="menu"] {
+    background-color: #FFFFFF !important;
+}
+
+div[data-baseweb="popover"] li, [data-baseweb="menu"] li {
+    color: #1A1A1A !important;
+    background-color: #FFFFFF !important;
+}
+
+/* Options dropdown container and items text color (high specificity overrides) */
+div[data-baseweb="popover"] span,
+div[data-baseweb="popover"] div,
+div[data-baseweb="popover"] li,
+div[data-baseweb="popover"] p,
+[data-baseweb="menu"] span,
+[data-baseweb="menu"] div,
+[data-baseweb="menu"] li,
+[data-baseweb="menu"] p {
+    color: #1A1A1A !important;
+}
+
+div[data-baseweb="popover"] li:hover, [data-baseweb="menu"] li:hover {
+    background-color: rgba(43, 76, 63, 0.08) !important;
+}
+
+/* Custom stButton (Process Audio Pipeline button) styling */
+div[data-testid="stButton"] button {
+    background-color: #2B4C3F !important; /* Premium Pine Green */
+    color: #FFFFFF !important;            /* White text */
+    border: 1px solid #2B4C3F !important;
+    border-radius: 100px !important;       /* Pill shape */
+    padding: 0.6rem 1.5rem !important;
+    font-weight: 600 !important;
+    transition: all 0.3s ease !important;
+    box-shadow: 0 4px 10px rgba(43, 76, 63, 0.15) !important;
+}
+
+div[data-testid="stButton"] button:hover {
+    background-color: #B5502D !important; /* Terracotta on hover */
+    border-color: #B5502D !important;
+    color: #FFFFFF !important;
+    box-shadow: 0 6px 15px rgba(181, 80, 45, 0.2) !important;
+    transform: translateY(-1px) !important;
+}
+
+div[data-testid="stButton"] button:active {
+    transform: translateY(1px) !important;
+}
+
+/* Ensure the button text color is white and overrides global font color */
+div[data-testid="stButton"] button, 
+div[data-testid="stButton"] button p, 
+div[data-testid="stButton"] button span {
+    color: #FFFFFF !important;
+}
+
 /* Visual match style for st.audio_input (dark-gray capsule container) */
 div[data-testid="stAudioInput"] {
     background-color: #303030 !important;
@@ -252,112 +360,108 @@ st.markdown("""
 st.markdown("""
 <div class="language-strip">
     <span class="lang-pill">Assamese</span>
-    <span class="lang-pill">Bodo</span>
-    <span class="lang-pill">Khasi</span>
-    <span class="lang-pill">Manipuri</span>
-    <span class="lang-pill">Nagamese</span>
 </div>
 """, unsafe_allow_html=True)
 
 st.subheader("🎙️ Ask your Question")
 
-# Render label/instruction outside and above the audio input bar
-st.markdown("<p style='color: #8B7355; font-family: \"Inter\", sans-serif; font-weight: 500; margin-bottom: 0.6rem; font-size: 0.95rem;'>Speak your query (healthcare or governance) in your local language:</p>", unsafe_allow_html=True)
+st.markdown("<p style='color: #8B7355; font-family: \"Inter\", sans-serif; font-weight: 500; margin-bottom: 0.6rem; font-size: 0.95rem;'>Choose a pre-recorded Assamese sample or upload your own WAV file:</p>", unsafe_allow_html=True)
 
-# Audio input widget for microphone capture with collapsed/hidden label
-audio_file = st.audio_input(
-    "Speak your query (healthcare or governance) in your local language:",
+# Selection list
+options = ["-- Choose an Option --", "Upload your own WAV file..."]
+for i, sample in enumerate(SAMPLES, 1):
+    options.append(f"Sample {i:02d}: {sample['label']}")
+
+selected_option = st.selectbox(
+    "Choose input source:",
+    options,
     label_visibility="collapsed"
 )
 
-if audio_file is not None:
-    st.info("Processing voice query...")
+audio_path_to_run = None
+uploaded_bytes = None
+
+if selected_option == "Upload your own WAV file...":
+    uploaded_file = st.file_uploader("Upload a WAV audio file:", type=["wav"])
+    if uploaded_file is not None:
+        uploaded_bytes = uploaded_file.read()
+elif selected_option != "-- Choose an Option --":
+    idx_str = selected_option.split("Sample ")[1].split(":")[0]
+    idx = int(idx_str) - 1
+    sample = SAMPLES[idx]
+    audio_path_to_run = os.path.join(PROJECT_ROOT, "tts", "outputs", sample["filename"])
+
+if audio_path_to_run or uploaded_bytes:
+    st.markdown("🔊 **Listen to the Input Query:**")
+    if audio_path_to_run:
+        with open(audio_path_to_run, "rb") as f:
+            st.audio(f.read(), format="audio/wav")
+    else:
+        st.audio(uploaded_bytes, format="audio/wav")
     
-    # Static temporary file paths to avoid locking issues with OS temp directories
-    input_path = "input_temp.wav"
-    output_path = "output_temp.wav"
+    run_btn = st.button("🚀 Process Audio Pipeline", use_container_width=True)
     
-    try:
-        # Save the uploaded/recorded audio file to input_temp.wav
-        input_saved = False
+    if run_btn:
+        import tempfile
+        import uuid
+        
+        temp_dir = tempfile.gettempdir()
+        unique_id = uuid.uuid4().hex
+        input_path = os.path.join(temp_dir, f"input_{unique_id}.wav")
+        output_path = os.path.join(temp_dir, f"output_{unique_id}.wav")
+        
         try:
-            with open(input_path, "wb") as f:
-                f.write(audio_file.read())
-            input_saved = True
-        except Exception as e:
-            print(f"Error saving input audio: {e}", file=sys.stderr)
-            st.error("Failed to save audio input. Please try again.")
-            
-        if input_saved:
-            # 1. Speech-to-Text Transcription
-            transcribed_text = None
-            try:
-                transcribed_text = speech_to_text(input_path)
-            except Exception as e:
-                print(f"Error in speech_to_text: {e}", file=sys.stderr)
-                
-            # If speech_to_text() returns empty/None → show "Couldn't hear you, please try again"
-            if not transcribed_text:
-                st.error("Couldn't hear you, please try again")
+            if audio_path_to_run:
+                with open(audio_path_to_run, "rb") as fsrc:
+                    input_bytes = fsrc.read()
             else:
-                # 2. Get Response (NLU chatbot processing)
-                reply_text = None
-                try:
-                    reply_text = get_response(transcribed_text)
-                except Exception as e:
-                    print(f"Error in get_response: {e}", file=sys.stderr)
-                    
-                # If get_response() fails or times out → show "Assistant is unavailable, please retry"
-                if not reply_text:
-                    st.error("Assistant is unavailable, please retry")
+                input_bytes = uploaded_bytes
+                
+            with open(input_path, "wb") as fdst:
+                fdst.write(input_bytes)
+                
+            with st.spinner("Processing Voice Pipeline (ASR → NLU → TTS)..."):
+                result = run_pipeline(input_path, output_path)
+            
+            transcribed_text = result.get("transcribed_text")
+            reply_text = result.get("reply_text")
+            output_audio_path = result.get("audio_output_path")
+            
+            if not transcribed_text:
+                st.error("Couldn't transcribe audio. Please try another sample or file.")
+            elif not reply_text:
+                st.error("Assistant was unable to generate a response. Please try again.")
+            else:
+                st.markdown(f"""
+                <div class="paper-card">
+                    <div class="card-label">📝 Transcribed Question</div>
+                    <div class="card-content">"{transcribed_text}"</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="paper-card">
+                    <div class="card-label">🤖 Assistant Response</div>
+                    <div class="card-content">{reply_text}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                if output_audio_path and os.path.exists(output_audio_path):
+                    with open(output_audio_path, "rb") as fout:
+                        st.markdown("🔊 **Listen to the Response:**")
+                        st.audio(fout.read(), format="audio/wav")
                 else:
-                    # Display the results using beautifully styled paper cards
-                    st.markdown(f"""
-                    <div class="paper-card">
-                        <div class="card-label">📝 Transcribed Question</div>
-                        <div class="card-content">"{transcribed_text}"</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.warning("TTS audio output could not be generated.")
                     
-                    st.markdown(f"""
-                    <div class="paper-card">
-                        <div class="card-label">🤖 Assistant Response</div>
-                        <div class="card-content">{reply_text}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # 3. Text-to-Speech Synthesis
-                    tts_success = False
-                    try:
-                        text_to_speech(reply_text, output_path)
-                        tts_success = True
-                    except Exception as e:
-                        print(f"Error in text_to_speech: {e}", file=sys.stderr)
-                        
-                    # If text_to_speech() fails → still show text reply even if audio fails
-                    if tts_success:
-                        try:
-                            # Read the generated output audio file
-                            with open(output_path, "rb") as f:
-                                audio_bytes = f.read()
-                                
-                            # Play the generated audio file
-                            st.markdown("🔊 **Listen to the Response:**")
-                            st.audio(audio_bytes, format="audio/wav")
-                        except Exception as e:
-                            print(f"Error reading/playing output audio: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
-        st.error(f"An error occurred during audio processing: {e}")
-    finally:
-        # Clean up temporary audio files safely
-        if os.path.exists(input_path):
-            try:
-                os.remove(input_path)
-            except Exception:
-                pass
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"Error running pipeline in Streamlit: {e}", file=sys.stderr)
+            st.error(f"Error running pipeline: {e}")
+            
+        finally:
+            if os.path.exists(input_path):
+                try: os.remove(input_path)
+                except: pass
+            if os.path.exists(output_path):
+                try: os.remove(output_path)
+                except: pass
+
